@@ -1,0 +1,769 @@
+---
+title: "2.0.1_Improved"
+author: "Theo Snow"
+date: "2025-08-01"
+output:
+  pdf_document: default
+  html_document: default
+---
+## **0. Package Calls, Options, and General Helper Functions**
+```{r}
+# ---- options ----
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,    
+  fig.width = 8,
+  fig.height = 5
+)
+options(scipen = 999)  # 
+
+# ---- libraries ----
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+  tidyverse, usmap, sf, broom, broom.mixed, scales, data.table,
+  tableone, knitr, kableExtra, gt, gtsummary, patchwork,
+  car, lmtest, sandwich, pscl, glmnet, conflicted, rgeoda, geodaData
+)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+
+# ---- paths helper ----
+crypto_data <- read.csv("") %>%
+  rename("Year" = "YEAR")
+Weighted_denominators <- read.csv("")
+state_abs <- data.frame(state.abb, state.name) %>%
+  mutate(state.name = tolower(state.name))
+Unweighted_denominators_month <- read.csv("") %>%
+  rename("Year" = "date2_year", "Month" = "date2_month")
+Unweighted_denominators_year <- read.csv("") %>%
+  rename("Year" = "date2_year") %>%
+  filter(Year >=2013 & Year <=2023)
+climate_regions_map <- read.csv("us_climate_regions.csv") %>%
+  rename("prefstate" = "state_code")
+
+
+# ---- constants ----
+ethrace_levels <- c("Hispanic","White", "African American", "Asian","Native American", "Other", "Unknown")
+age_levels_table1 <- c("Under 5", "5 to 9","10 to 14", "16 to 19","20 to 24", "25 to 29", "30 to 34", "35 to 39",
+                       "40 to 44", "45 to 49", "50 to 54", "55 to 59","60 to 64", "65 and Over", "Unknown")
+gender_levels <- c("Male", "Female", "Unknown")
+urban_levels <- c("Urban", "Rural", "Unknown")
+
+# ---- helper functions ----
+
+# Recode race/ethnicity to harmonized values and create EthRace
+recode_ethrace <- function(df, race_col = "prefrace", eth_col = "prefethnicity") {
+  df %>%
+    mutate(
+      !!sym(race_col) := case_when(
+        .data[[race_col]] == "Black or African American" ~ "African American",
+        .data[[race_col]] == "Native Hawaiian or Other Pacific Islander" ~ "Asian",
+        .data[[race_col]] == "American Indian or Alaska Native" ~ "Native American",
+        .data[[race_col]] == "some other race" ~ "Other",
+        TRUE ~ .data[[race_col]]
+      ),
+      !!sym(eth_col) := case_when(
+        .data[[eth_col]] == "Non-Hispanic" ~ "Non-His",
+        .data[[eth_col]] == "Hispanic or Latino" ~ "His_x",
+        TRUE ~ .data[[eth_col]]
+      )
+    ) %>%
+    mutate(
+      EthRace = paste(.data[[eth_col]], .data[[race_col]], sep = " "),
+      EthRace = case_when(
+        grepl("His_x", EthRace) ~ "Hispanic",
+        TRUE ~ EthRace
+      ),
+      EthRace = case_when(
+        EthRace %in% c("Non-His Unknown", "Unknown Other", "Unknown White",
+                       "Unknown Black", "Unknown Unknown", "Unknown Asian",
+                       "Unknown Native A", "Unknown Pacific I") ~ "Unknown",
+        TRUE ~ EthRace
+      ),
+      EthRace = gsub("Non-His ", "", EthRace),
+      EthRace = gsub("Unknown ", "", EthRace)
+    )
+}
+
+# Standardize age groups
+standardize_age <- function(df) {
+  df %>%
+    mutate(age_group = case_when(
+      age_group %in% c("Under 1", "1 to 4") ~ "Under 5",
+      TRUE ~ age_group
+    ))
+}
+
+# Clean urban/rural & gender for display
+standardize_demographics <- function(df) {
+  df %>%
+    mutate(
+      prefurban = case_when(
+        tolower(prefurban) == "urban" ~ "Urban",
+        tolower(prefurban) == "rural" ~ "Rural",
+        is.na(prefurban) ~ "Unknown",
+        TRUE ~ prefurban
+      ),
+      prefgender = case_when(
+        prefgender == "Other or Unknown" ~ "Unknown",
+        TRUE ~ prefgender
+      )
+    )
+}
+
+# Create incidence map with hatching for low counts
+make_state_map <- function(df, value_col, cut_breaks, cut_labels,
+                           fill_palette, title, legend_title,
+                           hatch_threshold = 5, hatch_data = NULL) {
+  stopifnot("state" %in% names(df))
+  df <- df %>% mutate(cut_val = cut(.data[[value_col]],
+                                   breaks = cut_breaks,
+                                   labels = cut_labels,
+                                   include.lowest = TRUE))
+  df$cut_val[df[[value_col]] == 1 & "1-10" %in% cut_labels] <- "1-10" # special case if needed
+  df$hatch <- ifelse(df[[value_col]] < hatch_threshold, TRUE, FALSE)
+  
+  p <- plot_usmap(data = df, values = "cut_val") +
+    scale_fill_manual(values = fill_palette, name = legend_title) +
+    labs(title = title) +
+    theme(panel.background = element_blank(), legend.position = "right") +
+    guides(fill = guide_legend(title = legend_title)) +
+    # add hatching for low counts
+    geom_sf_pattern(
+      data = df %>% filter(hatch == TRUE),
+      aes(geometry = geom, pattern = hatch),
+      fill = NA,
+      pattern_angle = 45,
+      pattern_density = 0.05,
+      pattern_spacing = 0.02,
+      color = "black",
+      size = 0.01
+    ) +
+    scale_pattern_manual(values = c("TRUE" = "stripe"), name = "< threshold", labels = c("TRUE" = "")) +
+    guides(pattern = guide_legend(title = "< threshold"))
+  p
+}
+
+# Fit linear trend per state
+fit_state_trends <- function(df, value_col = "estimate") {
+  df_list <- split(df, df$prefstate)
+  df_list <- map(df_list, ~ mutate(.x, Year = as.numeric(as.character(Year))))
+  lm_list <- map(df_list, ~ {
+    if (nrow(.x) >= 3 && all(.x[[value_col]] > 0, na.rm = TRUE)) {
+      lm_formula <- reformulate("Year", response = value_col)
+      lm(lm_formula, data = .x)
+    } else NULL
+  })
+  res <- imap_df(lm_list, ~ {
+    if (is.null(.x)) return(NULL)
+    tidy(.x) %>%
+      filter(term == "Year") %>%
+      mutate(State = .y)
+  })
+  res
+}
+
+# Utility to build time-blocked incidence summaries
+summarize_by_time_block <- function(df, year_range, weighted = FALSE) {
+  low <- year_range[1]; high <- year_range[2]
+  sub <- df %>%
+    filter(as.numeric(as.character(Year)) >= low,
+           as.numeric(as.character(Year)) <= high) %>%
+    group_by(prefstate) %>%
+    summarize(
+      nFungalPts = if (weighted) sum(weighted_nPatient, na.rm = TRUE) else sum(nFungalPts, na.rm = TRUE),
+      nALLpts = sum(Sample_Strata_Denom, na.rm = TRUE)
+    ) %>%
+    mutate(
+      measure = 100000 * (nFungalPts / nALLpts)
+    ) %>%
+    rename(state = prefstate)
+  sub
+}
+```
+
+## **1. Data loading & initial cleaning**
+```{r}
+# Read raw data
+crypto_data <- read_csv("") %>%
+  rename("Year" = "YEAR") %>%
+  recode_ethrace() %>%
+  standardize_age() %>%
+  standardize_demographics()
+
+Weighted_denominators <- read_csv("") %>%
+  mutate(Year = as.factor(Year))
+
+Unweighted_denominators_month <- read_csv("") %>%
+  rename("Year" = "date2_year", "Month" = "date2_month")
+
+Unweighted_denominators_year <- read_csv("") %>%
+  rename("Year" = "date2_year") %>%
+  filter(Year >= 2013 & Year <= 2023) %>%
+  recode_ethrace() %>%
+  standardize_age() %>%
+  standardize_demographics()
+
+climate_regions_map <- read_csv("") %>%
+  rename(prefstate = state_code)
+
+# Factor conversions
+crypto_data <- crypto_data %>%
+  mutate(
+    Year = as.factor(Year),
+    EthRace = factor(EthRace, levels = ethrace_levels),
+    age_group = factor(age_group, levels = c("Under 5", "5 to 9","10 to 14", "16 to 19","20 to 24", "25 to 29", "30 to 34", "35 to 39",
+                                            "40 to 44", "45 to 49", "50 to 54", "55 to 59","60 to 64", "65 and Over", "Unknown")),
+    prefgender = factor(prefgender, levels = gender_levels),
+    prefurban = factor(prefurban, levels = urban_levels)
+  )
+```
+
+## **2. Aggregations (grouped data)**
+```{r}
+# Yearly grouped
+crypto_data_grouped_year <- crypto_data %>%
+  group_by(Year, prefstate, prefurban, EthRace, prefgender, age_group,
+           category_Immunocompetent, category_HIV_AIDS, category_Immunocompromised_Unspecified,
+           category_Leukemia, category_Lymphoma, category_Medication_Suppression,
+           category_Organ_Transplant) %>%
+  summarize(nPatients = sum(nPatients), .groups = "drop") %>%
+  mutate(Year = as.factor(Year))
+
+# Unweighted denominators annual grouped
+Unweighted_denominators_year_grouped <- Unweighted_denominators_year %>%
+  group_by(Year, prefstate, prefurban, EthRace, prefgender, age_group) %>%
+  summarize(nPatient = sum(nPatient), .groups = "drop") %>%
+  mutate(Year = as.factor(Year))
+
+```
+
+## **3. Weighted Analysis**
+```{r}
+# Prepare weighted crypto data
+weighted.crypto_data_comorbids <- crypto_data_grouped_year %>%
+  group_by(Year, prefstate, EthRace, prefgender, age_group,
+           category_Immunocompetent, category_HIV_AIDS,
+           category_Immunocompromised_Unspecified, category_Leukemia,
+           category_Lymphoma, category_Medication_Suppression,
+           category_Organ_Transplant) %>%
+  summarize(nPatient = sum(nPatients), .groups = "drop") %>%
+  filter(
+    EthRace != "Unknown", prefgender != "Other or Unknown",
+    !is.na(prefstate), age_group != "not mapped", age_group != "Unknown"
+  ) %>%
+  mutate(Year = as.factor(Year))
+
+weighted.crypto_data <- crypto_data_grouped_year %>%
+  group_by(Year, prefstate, prefurban, EthRace, prefgender, age_group) %>%
+  summarize(nPatient = sum(nPatients), .groups = "drop") %>%
+  filter(
+    EthRace != "Unknown", prefgender != "Other or Unknown",
+    !is.na(prefstate), age_group != "not mapped", age_group != "Unknown"
+  ) %>%
+  mutate(Year = as.factor(Year))
+
+# Join denominators
+weighted.crypto_data_comorbids <- full_join(
+  weighted.crypto_data_comorbids,
+  Weighted_denominators,
+  by = c("Year", "prefstate", "prefgender", "EthRace", "age_group")
+) %>%
+  filter(!is.na(Sample_Strata_Denom)) %>%
+  mutate(nPatient = replace_na(nPatient, 0))
+
+weighted.crypto_data_final_merged <- full_join(
+  weighted.crypto_data,
+  Weighted_denominators,
+  by = c("Year", "prefstate", "prefgender", "EthRace", "age_group")
+) %>%
+  filter(!is.na(Sample_Strata_Denom)) %>%
+  mutate(nPatient = replace_na(nPatient, 0),
+         weighted_nPatient = nPatient * weights,
+         Standard_Inc = weighted_nPatient / ACS_Strata_Denom)
+```
+
+## **4. Table 1: Demographics of fungal cohort**
+```{r}
+table_1_data <- crypto_data %>%
+  filter(nPatients > 0) %>%
+  uncount(nPatients) %>%
+  standardize_demographics() %>%
+  mutate(
+    prefgender = factor(prefgender, levels = gender_levels),
+    prefurban = factor(prefurban, levels = urban_levels),
+    EthRace = factor(EthRace, levels = ethrace_levels),
+    age_group = factor(age_group, levels = age_levels_table1)
+  ) %>%
+  rename(
+    "Gender" = prefgender,
+    "Patient Location" = prefurban,
+    "Age Group" = age_group,
+    "Ethnicity and Race" = EthRace
+  )
+
+my.vars <- c("Year", "Gender", "Patient Location", "Age Group", "Ethnicity and Race",
+             "category_Immunocompetent", "category_HIV_AIDS", "category_Immunocompromised_Unspecified",
+             "category_Leukemia", "category_Lymphoma", "category_Medication_Suppression",
+             "category_Organ_Transplant")
+my.fvars <- my.vars
+
+
+formatted_table <- table_1_data %>%
+  tbl_summary(
+    include = c("Gender", "Patient Location", "Ethnicity and Race", "Age Group")
+  ) %>%
+  as_kable_extra(booktabs = TRUE) %>%
+  kable_styling(font_size = 12, position = "center", latex_options = "hold_position") %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+
+formatted_table
+
+```
+
+## **5. Incidence over time (unweighted vs weighted)**
+```{r}
+# Prepare summary incidence data
+standardized_weighted.crypto_data <- weighted.crypto_data %>%
+  rename(nFungalPts = nPatient) %>%
+  mutate(E_nFungalPts = weights*nFungalPts)
+
+summary_data_py <- standardized_weighted.crypto_data %>%
+  group_by(Year) %>%
+  summarize(
+    nFungalPts = sum(as.numeric(nFungalPts), na.rm = TRUE),
+    E_nFungalPts = sum(as.numeric(E_nFungalPts), na.rm = TRUE),
+    nALLpts = sum(as.numeric(Sample_Strata_Denom), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    estimate = 100000 * (nFungalPts / nALLpts),
+    weighted_estimate = 100000 * (E_nFungalPts / nALLpts)
+  )
+
+# Poisson regression for trend
+mod_unweighted <- glm(nFungalPts ~ -1 + offset(log(nALLpts)) + as.factor(Year),
+                      data = summary_data_py, family = poisson())
+mod_weighted <- glm(E_nFungalPts ~ -1 + offset(log(nALLpts)) + as.factor(Year),
+                    data = summary_data_py, family = poisson())
+
+# Extract estimates for ribbons
+mod_1_output <- tidy(mod_unweighted, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(-term, -statistic, -p.value, -std.error) %>%
+  rename(U_estimate = estimate, U_conf.low = conf.low, U_conf.high = conf.high) %>%
+  mutate(across(everything(), ~ . * 100000))
+mod_2_output <- tidy(mod_weighted, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(-term, -statistic, -p.value, -std.error) %>%
+  rename(W_estimate = estimate, W_conf.low = conf.low, W_conf.high = conf.high) %>%
+  mutate(across(everything(), ~ . * 100000))
+
+summary_data_py <- bind_cols(summary_data_py, mod_1_output, mod_2_output)
+
+# Plot
+plot_IR_py <- summary_data_py %>%
+  ggplot(aes(x = as.factor(Year), group = 1)) +
+  geom_point(aes(y = as.numeric(U_estimate), color = "Sample Incidence")) +
+  geom_line(aes(y = as.numeric(U_estimate), color = "Sample Incidence")) +
+  geom_ribbon(aes(ymin = U_conf.low, ymax = U_conf.high, fill = "Sample Incidence"),
+              alpha = 0.2, linetype = 2) +
+  geom_point(aes(y = as.numeric(W_estimate), color = "Population Incidence")) +
+  geom_line(aes(y = as.numeric(W_estimate), color = "Population Incidence")) +
+  geom_ribbon(aes(ymin = W_conf.low, ymax = W_conf.high, fill = "Population Incidence"),
+              alpha = 0.2, linetype = 2) +
+  scale_color_manual(
+    values = c("Population Incidence" = "#d95f02", "Sample Incidence" = "#1b9e77"),
+    name = "Incidence Estimates"
+  ) +
+  scale_fill_manual(
+    values = c("Population Incidence" = "#d95f02", "Sample Incidence" = "#1b9e77"),
+    name = "Incidence Estimates"
+  ) +
+  labs(
+    x = "Year",
+    y = "Incidence Rate (per 100,000)",
+    title = "Sample and Population-Level Incidence Rates of Cryptococcosis, 2013–2023"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+print(plot_IR_py)
+if (params$save_plots) ggsave("plot_IR_py.jpeg", plot = plot_IR_py, width = 6, height = 4, dpi = 300)
+
+```
+
+## **6. State-level incidence maps**
+```{r}
+# Prepare summary for full period (unweighted)
+summary_data_state <- crypto_data %>%
+  group_by(prefstate) %>%
+  summarize(nFungalPts = sum(nPatients), nALLpts = sum(nPatient, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Incidence = 1000000 * (nFungalPts / nALLpts)) %>%
+  rename(state = prefstate)
+
+# Merge boundary and plot
+boundary_data <- us_map() %>%
+  select(-full) %>%
+  rename(state = abbr) %>%
+  st_as_sf(crs = 4326)
+
+plot_full <- make_state_map(
+  df = left_join(summary_data_state, boundary_data, by = "state") %>% filter(!is.na(fips)),
+  value_col = "Incidence",
+  cut_breaks = c(0, 0.00000000000001, 2.5, 5, 7.5, 10, 15, 20, 25, Inf),
+  cut_labels = c("0", "<2.5", "2.5-5", "5-7.5", "7.5-10", "10-15", "15-20", "20-25", "25+"),
+  fill_palette = c("0" = "lightgrey", "<2.5" = "#ffeda0", "2.5-5" = "#fed976",
+                   "5-7.5" = "#feb24c", "7.5-10" = "#fd8d3c",
+                   "10-15" = "#fc4e2a", "15-20" = "#e31a1c", "20-25" = "#bd0026", "25+" = "#800026"),
+  title = "Cryptococcosis Incidence Per State, 2013-2023",
+  legend_title = "Incidence per 1,000,000"
+)
+print(plot_full)
+if (params$save_plots) ggsave("incidence_full_period.jpeg", plot = plot_full, dpi = 300, width = 10, height = 6)
+
+# Time blocks example loop
+time_blocks <- list(
+  `2013_2015` = c(2013, 2015),
+  `2016_2018` = c(2016, 2018),
+  `2019_2021` = c(2019, 2021),
+  `2022_2023` = c(2022, 2023)
+)
+
+for (name in names(time_blocks)) {
+  yr <- time_blocks[[name]]
+  block_df <- summarize_by_time_block(weighted.crypto_data_final_merged, yr, weighted = FALSE)
+  block_map_df <- left_join(block_df, boundary_data, by = c("state" = "state")) %>%
+    filter(!is.na(fips))
+  p <- make_state_map(
+    df = block_map_df,
+    value_col = "measure",
+    cut_breaks = c(0, 0.00000000000001, 2.5, 5, 7.5, 10, 15, 20, 25, Inf),
+    cut_labels = c("0", "<2.5", "2.5-5", "5-7.5", "7.5-10", "10-15", "15-20", "20-25", "25+"),
+    fill_palette = c("0" = "lightgrey", "<2.5" = "#ffeda0", "2.5-5" = "#fed976",
+                     "5-7.5" = "#feb24c", "7.5-10" = "#fd8d3c",
+                     "10-15" = "#fc4e2a", "15-20" = "#e31a1c", "20-25" = "#bd0026", "25+" = "#800026"),
+    title = paste0("Incidence: ", gsub("_", "-", name)),
+    legend_title = "Incidence per 100,000"
+  )
+  print(p)
+  if (params$save_plots) ggsave(paste0("incidence_", name, ".jpeg"), plot = p, dpi = 300, width = 10, height = 6)
+}
+```
+
+## **7. Trend analysis by state**
+```{r}
+# Prepare state-year incidence for weighted data
+state_year <- weighted.crypto_data_final_merged %>%
+  group_by(Year, prefstate) %>%
+  summarize(
+    nPatient = sum(weighted_nPatient, na.rm = TRUE),
+    Sample_Strata_Denom = sum(Sample_Strata_Denom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    estimate = 100000 * (nPatient / Sample_Strata_Denom),
+    prefstate = factor(prefstate)
+  ) %>%
+  filter(prefstate != "DC") # optional exclusion
+
+trend_results <- fit_state_trends(state_year, value_col = "estimate")
+print(trend_results %>% arrange(p.value))
+
+```
+
+## **8. Group-specific incidence trends**
+### **8.1 Ethnicity / Race trends**
+```{r ethnicity-trends}
+# Weighted incidence by EthRace over time
+ethrace_trends <- weighted.crypto_data_final_merged %>%
+  filter(!grepl("Unknown", EthRace)) %>%
+  group_by(Year, EthRace) %>%
+  summarize(
+    weighted_nPatient = sum(weighted_nPatient, na.rm = TRUE),
+    Sample_Strata_Denom = sum(Sample_Strata_Denom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(estimate = 100000 * (weighted_nPatient / Sample_Strata_Denom),
+         EthRace = factor(EthRace, levels = ethrace_levels))
+
+ggplot(ethrace_trends, aes(x = as.numeric(Year), y = estimate, group = EthRace, color = EthRace)) +
+  geom_point(size = 0.75) +
+  geom_line() +
+  facet_wrap(~EthRace, nrow = 1, strip.position = "bottom") +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 3)) +
+  labs(
+    title = "Cryptococcosis Incidence by Ethnicity and Race, 2013-2023",
+    x = "Year",
+    y = "Incidence per 100,000",
+    color = "Ethnicity and Race"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+```
+
+### **8.2 Age trends**
+```{r}
+age_trends <- weighted.crypto_data_final_merged %>%
+  filter(!grepl("Unknown", age_group)) %>%
+  group_by(Year, age_group) %>%
+  summarize(
+    weighted_nPatient = sum(weighted_nPatient, na.rm = TRUE),
+    Sample_Strata_Denom = sum(Sample_Strata_Denom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    estimate = 100000 * (weighted_nPatient / Sample_Strata_Denom),
+    age_group = factor(age_group, levels = c("Under 1", "1 to 4", "5 to 9", "10 to 14", "15 to 19",
+                                             "20 to 24", "25 to 29", "30 to 34", "35 to 39",
+                                             "40 to 44", "45 to 49", "50 to 54", "55 to 59",
+                                             "60 to 64", "65 and Over"))
+  )
+
+ggplot(age_trends, aes(x = as.numeric(Year), y = estimate, group = age_group, color = age_group)) +
+  geom_point(size = 0.6) +
+  geom_line() +
+  facet_wrap(~age_group, nrow = 1, strip.position = "bottom") +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 3)) +
+  labs(
+    title = "Cryptococcosis Incidence by Age Group, 2013-2023",
+    x = "Year",
+    y = "Incidence per 100,000",
+    color = "Age Group"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## **9. Multivariable regression with robust standard errors & adjusted IRR plots**
+### **9.1 Helper for quasi-Poisson with robust SEs**
+```{r}
+library(sandwich)
+library(broom)
+
+# Fit quasi-Poisson and return exponentiated coefficients with robust CIs
+fit_qp <- function(formula, data, offset_var, weight_var = "weights") {
+  mod <- glm(formula, data = data,
+             family = quasipoisson(link = "log"),
+             offset = log(data[[offset_var]]),
+             weights = data[[weight_var]])
+  vcov_robust <- vcovHC(mod, type = "HC0")
+  tidy_mod <- tidy(mod, exponentiate = TRUE, conf.int = TRUE, vcov. = vcov_robust)
+  tidy_mod
+}
+
+```
+
+### **9.2 Prepare modeling dataset**
+```{r}
+# Build immuno_status from hot-encoded comorbidities
+model_df <- weighted.crypto_data_final_merged %>%
+  mutate(
+    immuno_status = case_when(
+      (category_HIV_AIDS + category_Immunocompromised_Unspecified + category_Leukemia +
+         category_Lymphoma + category_Medication_Suppression + category_Organ_Transplant) > 1 ~ "Multiple",
+      category_HIV_AIDS == 1 ~ "HIV/AIDS",
+      category_Immunocompromised_Unspecified == 1 ~ "Immunocompromised_Unspecified",
+      category_Leukemia == 1 ~ "Leukemia",
+      category_Lymphoma == 1 ~ "Lymphoma",
+      category_Medication_Suppression == 1 ~ "Medication_Suppression",
+      category_Organ_Transplant == 1 ~ "Organ_Transplant",
+      category_Immunocompetent == 1 ~ "Immunocompetent",
+      TRUE ~ "Immunocompetent"
+    ),
+    # clean up levels / references
+    EthRace = relevel(factor(EthRace, levels = ethrace_levels), ref = "White"),
+    prefgender = relevel(factor(prefgender, levels = gender_levels), ref = "Female"),
+    prefurban = relevel(factor(prefurban, levels = urban_levels), ref = "Rural"),
+    age_group = relevel(factor(age_group), ref = "20 to 24"),
+    prefstate = relevel(factor(prefstate), ref = "IN"),
+    immuno_status = relevel(factor(immuno_status), ref = "Immunocompetent")
+  ) %>%
+  # join climate region if needed
+  left_join(climate_regions_map, by = c("prefstate" = "prefstate")) %>%
+  mutate(climate_regions = if_else(is.na(climate_regions), "Unknown", climate_regions)) %>%
+  mutate(climate_regions = relevel(factor(climate_regions), ref = "NORTHEN ROCKIES AND PLAINS (WEST NORTH CENTRAL)")) %>%
+  # ensure numeric offset
+  rename(nFungalPts = nPatient,
+         nALLpts = Sample_Strata_Denom)
+
+```
+
+### **9.3 Full adjusted model**
+```{r}
+full_formula <- as.formula("nFungalPts ~ as.factor(Year) + EthRace + prefgender + prefurban + age_group + prefstate + immuno_status + climate_regions")
+full_mod <- fit_qp(full_formula, data = model_df, offset_var = "nALLpts", weight_var = "weights")
+full_mod %>% arrange(p.value) %>% head(10)
+```
+
+### **9.4 Plotting function for adjusted IRRs**
+```{r}
+plot_irr <- function(tidy_df, pattern, ref_label, title, x_label = "Adjusted Incidence Rate Ratio", ylim = c(0, NA)) {
+  df <- tidy_df %>%
+    filter(grepl(pattern, term)) %>%
+    mutate(
+      term_clean = gsub(pattern, "", term),
+      term_clean = str_replace_all(term_clean, "^", ""), # extra cleanup if needed
+      term_clean = str_trim(term_clean)
+    ) %>%
+    # add reference row if missing
+    bind_rows(
+      tibble(
+        term = NA_character_,
+        estimate = 1,
+        conf.low = 1,
+        conf.high = 1,
+        term_clean = ref_label,
+        p.value = NA,
+        std.error = NA,
+        statistic = NA
+      )
+    ) %>%
+    distinct(term_clean, .keep_all = TRUE) %>%
+    arrange(estimate) %>%
+    mutate(label = sprintf("%.2f", estimate))
+  
+  ggplot(df, aes(x = reorder(term_clean, estimate), y = estimate)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    coord_flip() +
+    labs(title = title, x = NULL, y = x_label, caption = "Reference = baseline") +
+    theme_minimal() +
+    scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+    geom_text(aes(label = label), vjust = -0.5, size = 3)
+}
+```
+
+### **9.5 Adjusted IRR plots for key exposures**
+```{r}
+# Ethnicity / Race
+p_ethrace <- plot_irr(full_mod, pattern = "EthRace", ref_label = "NH White",
+                      title = "Adjusted IRRs for Cryptococcosis Diagnosis by Ethnicity and Race")
+print(p_ethrace)
+if (params$save_plots) ggsave("adj_IRR_ethrace.jpeg", plot = p_ethrace, width = 8, height = 5)
+
+# Age Group
+p_agegroup <- plot_irr(full_mod, pattern = "age_group", ref_label = "20 to 24",
+                       title = "Adjusted IRRs for Cryptococcosis Diagnosis by Age Group")
+print(p_agegroup)
+if (params$save_plots) ggsave("adj_IRR_agegroup.jpeg", plot = p_agegroup, width = 8, height = 5)
+
+# Gender
+p_gender <- plot_irr(full_mod, pattern = "prefgender", ref_label = "Female",
+                     title = "Adjusted IRRs for Cryptococcosis Diagnosis by Gender")
+print(p_gender)
+if (params$save_plots) ggsave("adj_IRR_gender.jpeg", plot = p_gender, width = 6, height = 4)
+
+# Urban/Rural
+# Note: variable name is prefurban
+p_urban <- plot_irr(full_mod, pattern = "prefurban", ref_label = "Rural",
+                    title = "Adjusted IRRs for Cryptococcosis Diagnosis by Patient Location")
+print(p_urban)
+if (params$save_plots) ggsave("adj_IRR_urban_rural.jpeg", plot = p_urban, width = 6, height = 4)
+
+# Comorbidities (immuno_status)
+p_comorbid <- plot_irr(full_mod, pattern = "immuno_status", ref_label = "Immunocompetent",
+                       title = "Adjusted IRRs for Cryptococcosis Diagnosis by Comorbidity Status")
+print(p_comorbid)
+if (params$save_plots) ggsave("adj_IRR_comorbid.jpeg", plot = p_comorbid, width = 8, height = 5)
+
+# Climate regions
+p_climate <- plot_irr(full_mod, pattern = "climate_regions", ref_label = "NORTHEN ROCKIES AND PLAINS (WEST NORTH CENTRAL)",
+                      title = "Adjusted IRRs for Cryptococcosis Diagnosis by Climate Region")
+print(p_climate)
+if (params$save_plots) ggsave("adj_IRR_climate_regions.jpeg", plot = p_climate, width = 8, height = 6)
+```
+
+## **10. Spatial cluster analysis (LISA)**
+### **10.1 Initialize Spatial Dataset**
+```{r}
+library(rgeoda)
+
+# Prepare state-level weighted incidence (population incidence)
+cluster_input <- weighted.crypto_data_final_merged %>%
+  group_by(prefstate) %>%
+  summarize(
+    weighted_nPatient = sum(weighted_nPatient, na.rm = TRUE),
+    Sample_Strata_Denom = sum(Sample_Strata_Denom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Pop_Pt_Proportion_100000 = 100000 * (weighted_nPatient / Sample_Strata_Denom),
+    state = prefstate
+  )
+
+# Spatial boundaries
+us_states_sf <- us_map("states") %>%
+  select(full, abbr, geom) %>%
+  rename(state = abbr) %>%
+  st_as_sf(crs = 4326) %>%
+  group_by(state) %>%
+  summarize(geometry = st_combine(geom), .groups = "drop") %>%
+  st_cast("MULTIPOLYGON")
+
+# Merge with incidence
+cluster_sf <- left_join(us_states_sf, cluster_input, by = c("state" = "state")) %>%
+  filter(!is.na(Pop_Pt_Proportion_100000))
+
+# Build spatial weights and local Moran's I
+w <- queen_weights(cluster_sf)
+lisa <- local_moran(w, cluster_sf["Pop_Pt_Proportion_100000"])
+
+# Annotate clusters
+cluster_sf$lisa_cluster <- factor(lisa_clusters(lisa),
+                                  levels = 0:4,
+                                  labels = c("Not Significant", "High-High", "Low-Low", "Low-High", "High-Low"))
+cluster_sf$lisa_p_values <- lisa$p_vals
+cluster_sf$hatch <- ifelse(cluster_sf$weighted_nPatient < 5, TRUE, FALSE)
+```
+
+### **10.2 Plot Spatial Clusters**
+```{r}
+# LISA cluster map
+lisa_palette <- c("Not Significant" = "lightgray",
+                  "Low-Low" = "#1b9e77",
+                  "High-Low" = "#fc9272",
+                  "Low-High" = "#66c2a5",
+                  "High-High" = "#d95f02")
+
+ggplot() +
+  geom_sf(data = cluster_sf, aes(fill = lisa_cluster), color = NA) +
+  scale_fill_manual(values = lisa_palette, name = "LISA Cluster") +
+  # hatching for low counts if desired
+  geom_sf_pattern(
+    data = cluster_sf %>% filter(hatch == TRUE),
+    aes(geometry = geometry, pattern = hatch),
+    fill = NA,
+    pattern_angle = 45,
+    pattern_density = 0.05,
+    pattern_spacing = 0.02,
+    color = "black",
+    size = 0.1
+  ) +
+  scale_pattern_manual(values = c("TRUE" = "stripe"), guide = "none") +
+  labs(
+    title = "LISA Cluster Map of State-Level Weighted Cryptococcosis Incidence",
+    subtitle = "Population incidence per 100,000 (2013–2023)",
+    caption = "Clusters: High-High, Low-Low, spatial outliers"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right") 
+
+if (params$save_plots) ggsave("lisa_cluster_map.jpeg", width = 10, height = 6, dpi = 300)
+```
+
+### **10.3 Extract Significant Clusters**
+```{r}
+significant_clusters <- cluster_sf %>%
+  filter(lisa_cluster != "Not Significant") %>%
+  select(state, lisa_cluster, lisa_p_values, Pop_Pt_Proportion_100000)
+print(significant_clusters)
+```
+
